@@ -78,7 +78,9 @@ export async function activate(context: vscode.ExtensionContext) {
 						renderOptions: {
 							after: {
 								contentIconPath: vscode.Uri.file(iconPath),
-								margin: "0 0 0 6px"
+								margin: "0 0 0 6px",
+								width: "10px",
+								height: "10px"
 							}
 						}
 					});
@@ -150,7 +152,6 @@ export async function activate(context: vscode.ExtensionContext) {
 function supportedLanguage(editor: vscode.TextEditor) {
 
 	const id = editor.document.languageId;
-
 	return [
 		"html",
 		"javascriptreact",
@@ -163,15 +164,33 @@ function supportedLanguage(editor: vscode.TextEditor) {
 
 function getAllIcons(baseDir: string): string[] {
 
-	const solidDir = path.join(baseDir, "solid");
+	const styles = [
+		"solid",
+		"regular",
+		"brands",
+		"light",
+		"thin",
+		"duotone"
+	];
 
-	if (!fs.existsSync(solidDir)) {
-		return [];
+	const icons = new Set<string>();
+
+	for (const style of styles) {
+
+		const dir = path.join(baseDir, style);
+
+		if (!fs.existsSync(dir)) {
+			continue;
+		}
+
+		const files = fs.readdirSync(dir);
+
+		for (const file of files) {
+			icons.add(file.replace(".svg", ""));
+		}
 	}
 
-	const files = fs.readdirSync(solidDir);
-
-	return files.map(file => file.replace(".svg", ""));
+	return Array.from(icons);
 }
 
 function parseFA(classString: string) {
