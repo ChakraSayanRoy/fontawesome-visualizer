@@ -6,6 +6,16 @@
   "engines": {
     "vscode": "^1.110.0"
   },
+  "publisher": "chakra",
+  "author": {
+    "name": "Chakra Sayan Roy",
+    "url": "https://github.com/ChakraSayanRoy"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/ChakraSayanRoy/fontawesome-visualizer",
+  "bugs": {
+    "url": "https://github.com/ChakraSayanRoy/fontawesome-visualizer/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/ChakraSayanRoy/fontawesome-visualizer"
@@ -29,8 +39,22 @@
       {
         "command": "fontawesome-visualizer.helloWorld",
         "title": "Hello World"
+      },
+      {
+        "command": "fontawesome-visualizer.setProPath",
+        "title": "FontAwesome Visualizer: Set Pro Icons Folder"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "FontAwesome Visualizer",
+      "properties": {
+        "fontawesomeVisualizer.proIconsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the FontAwesome Pro SVG 'svgs' folder."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",

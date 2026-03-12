@@ -15,11 +15,58 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	const storagePath = context.globalStorageUri.fsPath;
 
+	const completionIconMap = new WeakMap<vscode.CompletionItem, string>();
+
+	const config = vscode.workspace.getConfiguration("fontawesomeVisualizer");
+
+	let proIconsPath = config.get<string>("proIconsPath") || "";
+
+	if (!proIconsPath) {
+
+		const result = await vscode.window.showInformationMessage(
+			"FontAwesome Visualizer: Set FontAwesome Pro SVG folder?",
+			"Select Folder",
+			"Skip"
+		);
+
+		if (result === "Select Folder") {
+
+			const folder = await vscode.window.showOpenDialog({
+				canSelectFolders: true,
+				canSelectFiles: false,
+				canSelectMany: false,
+				openLabel: "Select FontAwesome svgs folder"
+			});
+
+			if (folder && folder.length > 0) {
+
+				proIconsPath = folder[0].fsPath;
+
+				await config.update(
+					"proIconsPath",
+					proIconsPath,
+					vscode.ConfigurationTarget.Global
+				);
+
+				vscode.window.showInformationMessage(
+					"FontAwesome Pro icons path saved."
+				);
+			}
+		}
+	}
+
 	if (!fs.existsSync(storagePath)) {
 		fs.mkdirSync(storagePath, { recursive: true });
 	}
 
-	const faSvgDir = await setupFontAwesome(storagePath);
+	let faSvgDir = "";
+
+	if (proIconsPath && fs.existsSync(proIconsPath)) {
+		console.log("Using FontAwesome Pro icons from:", proIconsPath);
+		faSvgDir = proIconsPath;
+	} else {
+		faSvgDir = await setupFontAwesome(storagePath);
+	}
 
 	iconList = getAllIcons(faSvgDir);
 
@@ -78,9 +125,9 @@ export async function activate(context: vscode.ExtensionContext) {
 						renderOptions: {
 							after: {
 								contentIconPath: vscode.Uri.file(iconPath),
-								margin: "0 0 0 6px",
-								width: "10px",
-								height: "10px"
+								margin: "0 0 0 2px",
+								width: "12px",
+								height: "12px"
 							}
 						}
 					});
@@ -121,26 +168,107 @@ export async function activate(context: vscode.ExtensionContext) {
 				"jsp"
 			],
 			{
-				provideCompletionItems() {
+				provideCompletionItems(document: vscode.TextDocument, position: vscode.Position) {
+
+					const line = document.lineAt(position).text;
+					const textBeforeCursor = line.substring(0, position.character);
+
+					const isInsideClass =
+						/(class|className)\s*=\s*["'][^"']*$/.test(textBeforeCursor);
+
+					if (!isInsideClass) {
+						return;
+					}
 
 					return iconList.map(icon => {
 
 						const item = new vscode.CompletionItem(
-							`fa-${icon}`,
+							{
+								label: `fa-${icon}`,
+								description: "FontAwesome"
+							},
 							vscode.CompletionItemKind.Enum
 						);
 
 						item.insertText = `fa-${icon}`;
+						item.detail = "FontAwesome Icon";
 
-						item.documentation = new vscode.MarkdownString(
-							`![icon](file://${path.join(faSvgDir, "solid", icon + ".svg")})`
-						);
+						completionIconMap.set(item, icon);
 
 						return item;
 					});
+				},
+				resolveCompletionItem(item: vscode.CompletionItem) {
+
+					const icon = completionIconMap.get(item);
+					if (!icon) {
+						return item;
+					}
+
+					const iconPath =
+						getLocalIcon("solid", icon, faSvgDir) ||
+						getLocalIcon("regular", icon, faSvgDir) ||
+						getLocalIcon("brands", icon, faSvgDir) ||
+						getLocalIcon("light", icon, faSvgDir) ||
+						getLocalIcon("thin", icon, faSvgDir) ||
+						getLocalIcon("duotone", icon, faSvgDir);
+
+					if (!iconPath) {
+						return item;
+					}
+
+					const md = new vscode.MarkdownString(
+						`### ${icon}\n\n<img src="file://${iconPath}" width="24"/>`
+					);
+
+					md.isTrusted = true;
+
+					item.documentation = md;
+
+					return item;
 				}
 			},
 			"-"
+		)
+	);
+
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(e => {
+			if (e.affectsConfiguration("fontawesomeVisualizer.proIconsPath")) {
+				vscode.window.showInformationMessage(
+					"FontAwesome Visualizer: Reload VS Code to apply Pro icon path."
+				);
+			}
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			"fontawesome-visualizer.setProPath",
+			async () => {
+
+				const folder = await vscode.window.showOpenDialog({
+					canSelectFolders: true,
+					canSelectFiles: false,
+					canSelectMany: false
+				});
+
+				if (!folder) {
+					return;
+				}
+
+				const config = vscode.workspace.getConfiguration("fontawesomeVisualizer");
+
+				await config.update(
+					"proIconsPath",
+					folder[0].fsPath,
+					vscode.ConfigurationTarget.Global
+				);
+
+				vscode.window.showInformationMessage(
+					"FontAwesome Pro path updated."
+				);
+			}
 		)
 	);
 
@@ -238,7 +366,11 @@ function getLocalIcon(style: string, icon: string, baseDir: string) {
 		return iconCache.get(key)!;
 	}
 
-	const file = path.join(baseDir, style, `${icon}.svg`);
+	let file = path.join(baseDir, style, `${icon}.svg`);
+
+	if (!fs.existsSync(file)) {
+		file = path.join(baseDir, "solid", `${icon}.svg`);
+	}
 
 	if (fs.existsSync(file)) {
 		iconCache.set(key, file);
