@@ -1,411 +1,444 @@
-import * as vscode from 'vscode';
-import axios from 'axios';
-import * as fs from 'fs';
-import * as path from 'path';
+import * as vscode from "vscode";
+import axios from "axios";
+import * as fs from "fs";
+import * as path from "path";
 import AdmZip from "adm-zip";
 
-const iconCache = new Map<string, string>();
+// --- Module-level state ---
+const iconCache = new Map<string, string | null>();
 let iconList: string[] = [];
+let cachedCompletionItems: vscode.CompletionItem[] | null = null;
+
+// Supported languages shared between decorations and completions
+const COMPLETION_LANGUAGES = [
+  "html",
+  "javascript",
+  "typescript",
+  "javascriptreact",
+  "typescriptreact",
+  "vue",
+  "svelte",
+  "jsp",
+];
+
+const DECORATION_LANGUAGES = [
+  "html",
+  "javascriptreact",
+  "typescriptreact",
+  "vue",
+  "svelte",
+  "jsp",
+];
 
 export async function activate(context: vscode.ExtensionContext) {
+  console.log("FontAwesome Visualizer Activated");
 
-	console.log("FontAwesome Visualizer Activated");
+  // Fix #3: Push decorationType into subscriptions so it's disposed on deactivation
+  const decorationType = vscode.window.createTextEditorDecorationType({});
+  context.subscriptions.push(decorationType);
 
-	const decorationType = vscode.window.createTextEditorDecorationType({});
+  const storagePath = context.globalStorageUri.fsPath;
 
-	const storagePath = context.globalStorageUri.fsPath;
+  // Fix #1: WeakMap (was already correct from previous fix)
+  const completionIconMap = new WeakMap<vscode.CompletionItem, string>();
 
-	const completionIconMap = new WeakMap<vscode.CompletionItem, string>();
+  const config = vscode.workspace.getConfiguration("fontawesomeVisualizer");
 
-	const config = vscode.workspace.getConfiguration("fontawesomeVisualizer");
+  let proIconsPath = config.get<string>("proIconsPath") || "";
 
-	let proIconsPath = config.get<string>("proIconsPath") || "";
+  if (!proIconsPath) {
+    const result = await vscode.window.showInformationMessage(
+      "FontAwesome Visualizer: Set FontAwesome Pro SVG folder?",
+      "Select Folder",
+      "Skip",
+    );
 
-	if (!proIconsPath) {
+    if (result === "Select Folder") {
+      const folder = await vscode.window.showOpenDialog({
+        canSelectFolders: true,
+        canSelectFiles: false,
+        canSelectMany: false,
+        openLabel: "Select FontAwesome svgs folder",
+      });
 
-		const result = await vscode.window.showInformationMessage(
-			"FontAwesome Visualizer: Set FontAwesome Pro SVG folder?",
-			"Select Folder",
-			"Skip"
-		);
+      if (folder && folder.length > 0) {
+        proIconsPath = folder[0].fsPath;
 
-		if (result === "Select Folder") {
+        await config.update(
+          "proIconsPath",
+          proIconsPath,
+          vscode.ConfigurationTarget.Global,
+        );
 
-			const folder = await vscode.window.showOpenDialog({
-				canSelectFolders: true,
-				canSelectFiles: false,
-				canSelectMany: false,
-				openLabel: "Select FontAwesome svgs folder"
-			});
+        vscode.window.showInformationMessage(
+          "FontAwesome Pro icons path saved.",
+        );
+      }
+    }
+  }
 
-			if (folder && folder.length > 0) {
+  if (!fs.existsSync(storagePath)) {
+    fs.mkdirSync(storagePath, { recursive: true });
+  }
 
-				proIconsPath = folder[0].fsPath;
+  let faSvgDir = "";
 
-				await config.update(
-					"proIconsPath",
-					proIconsPath,
-					vscode.ConfigurationTarget.Global
-				);
+  if (proIconsPath && fs.existsSync(proIconsPath)) {
+    console.log("Using FontAwesome Pro icons from:", proIconsPath);
+    faSvgDir = proIconsPath;
+  } else {
+    // Fix #7: Show progress notification while downloading
+    faSvgDir = await setupFontAwesome(storagePath);
+  }
 
-				vscode.window.showInformationMessage(
-					"FontAwesome Pro icons path saved."
-				);
-			}
-		}
-	}
+  iconList = getAllIcons(faSvgDir);
 
-	if (!fs.existsSync(storagePath)) {
-		fs.mkdirSync(storagePath, { recursive: true });
-	}
+  // Fix #4: Build completion items once and cache them
+  function buildCompletionItems() {
+    if (cachedCompletionItems) {
+      return cachedCompletionItems;
+    }
 
-	let faSvgDir = "";
+    cachedCompletionItems = iconList.map((icon) => {
+      const item = new vscode.CompletionItem(
+        {
+          label: `fa-${icon}`,
+          description: "FontAwesome",
+        },
+        vscode.CompletionItemKind.Enum,
+      );
 
-	if (proIconsPath && fs.existsSync(proIconsPath)) {
-		console.log("Using FontAwesome Pro icons from:", proIconsPath);
-		faSvgDir = proIconsPath;
-	} else {
-		faSvgDir = await setupFontAwesome(storagePath);
-	}
+      completionIconMap.set(item, icon);
 
-	iconList = getAllIcons(faSvgDir);
+      return item;
+    });
 
-	let timeout: NodeJS.Timeout | undefined;
+    return cachedCompletionItems;
+  }
 
-	function triggerUpdate(editor: vscode.TextEditor) {
+  let timeout: NodeJS.Timeout | undefined;
 
-		if (!supportedLanguage(editor)) {
-			return;
-		}
+  function triggerUpdate(editor: vscode.TextEditor) {
+    if (!supportedLanguage(editor, DECORATION_LANGUAGES)) {
+      return;
+    }
 
-		if (timeout) {
-			clearTimeout(timeout);
-		}
+    if (timeout) {
+      clearTimeout(timeout);
+    }
 
-		timeout = setTimeout(() => {
-			updateDecorations(editor);
-		}, 120);
-	}
+    timeout = setTimeout(() => {
+      updateDecorations(editor);
+    }, 120);
+  }
 
-	async function updateDecorations(editor: vscode.TextEditor) {
+  async function updateDecorations(editor: vscode.TextEditor) {
+    const visibleRanges = editor.visibleRanges;
+    const decorations: vscode.DecorationOptions[] = [];
 
-		const visibleRanges = editor.visibleRanges;
-		const decorations: vscode.DecorationOptions[] = [];
+    for (const range of visibleRanges) {
+      for (let line = range.start.line; line <= range.end.line; line++) {
+        const textLine = editor.document.lineAt(line);
+        const text = textLine.text;
 
-		for (const range of visibleRanges) {
+        const regex =
+          /<i\b[^>]*\b(class|className)\s*=\s*["']([^"']*fa-[^"']*)["'][^>]*>/g;
 
-			for (let line = range.start.line; line <= range.end.line; line++) {
+        let match;
 
-				const textLine = editor.document.lineAt(line);
-				const text = textLine.text;
+        while ((match = regex.exec(text))) {
+          const classString = match[2];
 
-				const regex = /<i\b[^>]*\b(class|className)\s*=\s*["']([^"']*fa-[^"']*)["'][^>]*>/g;
+          const parsed = parseFA(classString);
+          if (!parsed) {
+            continue;
+          }
 
-				let match;
+          // Fix #1: getLocalIcon now returns null on miss, properly falsy
+          const iconPath = getLocalIcon(parsed.style, parsed.icon, faSvgDir);
+          if (!iconPath) {
+            continue;
+          }
 
-				while ((match = regex.exec(text))) {
+          const start = new vscode.Position(line, match.index);
+          const end = new vscode.Position(line, match.index + match[0].length);
 
-					const classString = match[2];
+          decorations.push({
+            range: new vscode.Range(start, end),
+            renderOptions: {
+              after: {
+                contentIconPath: vscode.Uri.file(iconPath),
+                margin: "0 0 0 2px",
+                width: "12px",
+                height: "12px",
+              },
+            },
+          });
+        }
+      }
+    }
 
-					const parsed = parseFA(classString);
-					if (!parsed) {
-						continue;
-					}
+    editor.setDecorations(decorationType, decorations);
+  }
 
-					const iconPath = getLocalIcon(parsed.style, parsed.icon, faSvgDir);
-					if (!iconPath) {
-						continue;
-					}
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) {
+        triggerUpdate(editor);
+      }
+    }),
+  );
 
-					const start = new vscode.Position(line, match.index);
-					const end = new vscode.Position(line, match.index + match[0].length);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      const editor = vscode.window.activeTextEditor;
+      if (editor && event.document === editor.document) {
+        triggerUpdate(editor);
+      }
+    }),
+  );
 
-					decorations.push({
-						range: new vscode.Range(start, end),
-						renderOptions: {
-							after: {
-								contentIconPath: vscode.Uri.file(iconPath),
-								margin: "0 0 0 2px",
-								width: "12px",
-								height: "12px"
-							}
-						}
-					});
-				}
-			}
-		}
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      COMPLETION_LANGUAGES,
+      {
+        provideCompletionItems(
+          document: vscode.TextDocument,
+          position: vscode.Position,
+        ) {
+          const line = document.lineAt(position).text;
+          const textBeforeCursor = line.substring(0, position.character);
 
-		editor.setDecorations(decorationType, decorations);
-	}
+          const isInsideClass = /(class|className)\s*=\s*["'][^"']*$/.test(
+            textBeforeCursor,
+          );
 
-	context.subscriptions.push(
-		vscode.window.onDidChangeActiveTextEditor(editor => {
-			if (editor) {
-				triggerUpdate(editor);
-			}
-		})
-	);
+          if (!isInsideClass) {
+            return;
+          }
 
-	context.subscriptions.push(
-		vscode.workspace.onDidChangeTextDocument(event => {
-			const editor = vscode.window.activeTextEditor;
-			if (editor && event.document === editor.document) {
-				triggerUpdate(editor);
-			}
-		})
-	);
+          // Fix #4: Return cached items instead of rebuilding every keystroke
+          return buildCompletionItems();
+        },
 
-	context.subscriptions.push(
-		vscode.languages.registerCompletionItemProvider(
-			[
-				"html",
-				"javascript",
-				"typescript",
-				"javascriptreact",
-				"typescriptreact",
-				"vue",
-				"svelte",
-				"jsp"
-			],
-			{
-				provideCompletionItems(document: vscode.TextDocument, position: vscode.Position) {
+        // Fix #5: async resolveCompletionItem to avoid blocking the UI thread
+        async resolveCompletionItem(item: vscode.CompletionItem) {
+          const icon = completionIconMap.get(item);
+          if (!icon) {
+            return item;
+          }
 
-					const line = document.lineAt(position).text;
-					const textBeforeCursor = line.substring(0, position.character);
+          // Fix #1: getLocalIcon returns null | string
+          const iconPath =
+            getLocalIcon("solid", icon, faSvgDir) ||
+            getLocalIcon("regular", icon, faSvgDir) ||
+            getLocalIcon("brands", icon, faSvgDir) ||
+            getLocalIcon("light", icon, faSvgDir) ||
+            getLocalIcon("thin", icon, faSvgDir) ||
+            getLocalIcon("duotone", icon, faSvgDir);
 
-					const isInsideClass =
-						/(class|className)\s*=\s*["'][^"']*$/.test(textBeforeCursor);
+          if (!iconPath) {
+            return item;
+          }
 
-					if (!isInsideClass) {
-						return;
-					}
+          // Fix #5: Use async file read instead of blocking readFileSync
+          const svgContent = await fs.promises.readFile(iconPath, "utf-8");
+          const dataUri = `data:image/svg+xml;base64,${Buffer.from(svgContent).toString("base64")}`;
 
-					return iconList.map(icon => {
+          const md = new vscode.MarkdownString(
+            `### ${icon}\n\n<img src="${dataUri}" width="24"/>\n\n*FontAwesome Icon*`,
+          );
+          md.isTrusted = true;
+          md.supportHtml = true;
 
-						const item = new vscode.CompletionItem(
-							{
-								label: `fa-${icon}`,
-								description: "FontAwesome"
-							},
-							vscode.CompletionItemKind.Enum
-						);
+          item.documentation = md;
+          return item;
+        },
+      },
+      "-", // trigger on dash
+      '"', // Fix #2: trigger when opening class string with double quote
+      "'", // Fix #2: trigger when opening class string with single quote
+    ),
+  );
 
-						item.insertText = `fa-${icon}`;
-						item.detail = "FontAwesome Icon";
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("fontawesomeVisualizer.proIconsPath")) {
+        // Fix #8: Clear icon cache when pro path changes so stale paths aren't served
+        iconCache.clear();
+        cachedCompletionItems = null;
 
-						completionIconMap.set(item, icon);
+        vscode.window.showInformationMessage(
+          "FontAwesome Visualizer: Reload VS Code to apply Pro icon path.",
+        );
+      }
+    }),
+  );
 
-						return item;
-					});
-				},
-				resolveCompletionItem(item: vscode.CompletionItem) {
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "fontawesome-visualizer.setProPath",
+      async () => {
+        const folder = await vscode.window.showOpenDialog({
+          canSelectFolders: true,
+          canSelectFiles: false,
+          canSelectMany: false,
+        });
 
-					const icon = completionIconMap.get(item);
-					if (!icon) {
-						return item;
-					}
+        if (!folder) {
+          return;
+        }
 
-					const iconPath =
-						getLocalIcon("solid", icon, faSvgDir) ||
-						getLocalIcon("regular", icon, faSvgDir) ||
-						getLocalIcon("brands", icon, faSvgDir) ||
-						getLocalIcon("light", icon, faSvgDir) ||
-						getLocalIcon("thin", icon, faSvgDir) ||
-						getLocalIcon("duotone", icon, faSvgDir);
+        const config = vscode.workspace.getConfiguration(
+          "fontawesomeVisualizer",
+        );
 
-					if (!iconPath) {
-						return item;
-					}
+        await config.update(
+          "proIconsPath",
+          folder[0].fsPath,
+          vscode.ConfigurationTarget.Global,
+        );
 
-					const md = new vscode.MarkdownString(
-						`### ${icon}\n\n<img src="file://${iconPath}" width="24"/>`
-					);
+        vscode.window.showInformationMessage("FontAwesome Pro path updated.");
+      },
+    ),
+  );
 
-					md.isTrusted = true;
-
-					item.documentation = md;
-
-					return item;
-				}
-			},
-			"-"
-		)
-	);
-
-	context.subscriptions.push(
-		vscode.workspace.onDidChangeConfiguration(e => {
-			if (e.affectsConfiguration("fontawesomeVisualizer.proIconsPath")) {
-				vscode.window.showInformationMessage(
-					"FontAwesome Visualizer: Reload VS Code to apply Pro icon path."
-				);
-			}
-		})
-	);
-
-	context.subscriptions.push(
-		vscode.commands.registerCommand(
-			"fontawesome-visualizer.setProPath",
-			async () => {
-
-				const folder = await vscode.window.showOpenDialog({
-					canSelectFolders: true,
-					canSelectFiles: false,
-					canSelectMany: false
-				});
-
-				if (!folder) {
-					return;
-				}
-
-				const config = vscode.workspace.getConfiguration("fontawesomeVisualizer");
-
-				await config.update(
-					"proIconsPath",
-					folder[0].fsPath,
-					vscode.ConfigurationTarget.Global
-				);
-
-				vscode.window.showInformationMessage(
-					"FontAwesome Pro path updated."
-				);
-			}
-		)
-	);
-
-	if (vscode.window.activeTextEditor) {
-		triggerUpdate(vscode.window.activeTextEditor);
-	}
+  if (vscode.window.activeTextEditor) {
+    triggerUpdate(vscode.window.activeTextEditor);
+  }
 }
 
-function supportedLanguage(editor: vscode.TextEditor) {
-
-	const id = editor.document.languageId;
-	return [
-		"html",
-		"javascriptreact",
-		"typescriptreact",
-		"vue",
-		"svelte",
-		"jsp"
-	].includes(id);
+// Fix #6: Accept an explicit language list so decoration and completion sets are intentional
+function supportedLanguage(editor: vscode.TextEditor, languages: string[]) {
+  return languages.includes(editor.document.languageId);
 }
 
 function getAllIcons(baseDir: string): string[] {
+  const styles = ["solid", "regular", "brands", "light", "thin", "duotone"];
 
-	const styles = [
-		"solid",
-		"regular",
-		"brands",
-		"light",
-		"thin",
-		"duotone"
-	];
+  const icons = new Set<string>();
 
-	const icons = new Set<string>();
+  for (const style of styles) {
+    const dir = path.join(baseDir, style);
 
-	for (const style of styles) {
+    if (!fs.existsSync(dir)) {
+      continue;
+    }
 
-		const dir = path.join(baseDir, style);
+    const files = fs.readdirSync(dir);
 
-		if (!fs.existsSync(dir)) {
-			continue;
-		}
+    for (const file of files) {
+      icons.add(file.replace(".svg", ""));
+    }
+  }
 
-		const files = fs.readdirSync(dir);
-
-		for (const file of files) {
-			icons.add(file.replace(".svg", ""));
-		}
-	}
-
-	return Array.from(icons);
+  return Array.from(icons);
 }
 
 function parseFA(classString: string) {
+  const styleMatch = classString.match(
+    /fa-(solid|regular|brands|light|thin|duotone)/,
+  );
 
-	const styleMatch = classString.match(/fa-(solid|regular|brands|light|thin|duotone)/);
+  const classes = classString.split(/\s+/);
 
-	const classes = classString.split(/\s+/);
+  let icon = "";
 
-	let icon = "";
+  for (const c of classes) {
+    if (!c.startsWith("fa-")) {
+      continue;
+    }
 
-	for (const c of classes) {
+    if (
+      c === "fa-solid" ||
+      c === "fa-regular" ||
+      c === "fa-brands" ||
+      c === "fa-light" ||
+      c === "fa-thin" ||
+      c === "fa-duotone"
+    ) {
+      continue;
+    }
 
-		if (!c.startsWith("fa-")) {
-			continue;
-		}
+    icon = c.replace("fa-", "");
+  }
 
-		if (
-			c === "fa-solid" ||
-			c === "fa-regular" ||
-			c === "fa-brands" ||
-			c === "fa-light" ||
-			c === "fa-thin" ||
-			c === "fa-duotone"
-		) {
-			continue;
-		}
+  if (!icon) {
+    return null;
+  }
 
-		icon = c.replace("fa-", "");
-	}
+  const style = styleMatch ? styleMatch[1] : "solid";
 
-	if (!icon) {
-		return null;
-	}
-
-	const style = styleMatch ? styleMatch[1] : "solid";
-
-	return { style, icon };
+  return { style, icon };
 }
 
-function getLocalIcon(style: string, icon: string, baseDir: string) {
+// Fix #1: Return null instead of "" for cache misses — semantically correct and unambiguously falsy
+function getLocalIcon(
+  style: string,
+  icon: string,
+  baseDir: string,
+): string | null {
+  const key = `${style}:${icon}`;
 
-	const key = `${style}:${icon}`;
+  if (iconCache.has(key)) {
+    return iconCache.get(key) ?? null;
+  }
 
-	if (iconCache.has(key)) {
-		return iconCache.get(key)!;
-	}
+  let file = path.join(baseDir, style, `${icon}.svg`);
 
-	let file = path.join(baseDir, style, `${icon}.svg`);
+  if (!fs.existsSync(file)) {
+    file = path.join(baseDir, "solid", `${icon}.svg`);
+  }
 
-	if (!fs.existsSync(file)) {
-		file = path.join(baseDir, "solid", `${icon}.svg`);
-	}
+  if (fs.existsSync(file)) {
+    iconCache.set(key, file);
+    return file;
+  }
 
-	if (fs.existsSync(file)) {
-		iconCache.set(key, file);
-		return file;
-	}
-
-	iconCache.set(key, "");
-	return "";
+  // Cache the miss as null so we don't re-check the filesystem
+  iconCache.set(key, null);
+  return null;
 }
 
-async function setupFontAwesome(storagePath: string) {
+// Fix #7: Wrap download in a progress notification
+async function setupFontAwesome(storagePath: string): Promise<string> {
+  const faDir = path.join(storagePath, "Font-Awesome-6.x", "svgs");
 
-	const faDir = path.join(storagePath, "Font-Awesome-6.x", "svgs");
+  if (fs.existsSync(faDir)) {
+    return faDir;
+  }
 
-	if (fs.existsSync(faDir)) {
-		return faDir;
-	}
+  const zipPath = path.join(storagePath, "fa.zip");
+  const url =
+    "https://github.com/FortAwesome/Font-Awesome/archive/refs/heads/6.x.zip";
 
-	const zipPath = path.join(storagePath, "fa.zip");
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "FontAwesome Visualizer: Downloading free icons...",
+      cancellable: false,
+    },
+    async (progress) => {
+      progress.report({ message: "Downloading..." });
 
-	const url = "https://github.com/FortAwesome/Font-Awesome/archive/refs/heads/6.x.zip";
+      const response = await axios.get(url, {
+        responseType: "arraybuffer",
+      });
 
-	console.log("Downloading FontAwesome pack...");
+      fs.writeFileSync(zipPath, response.data);
 
-	const response = await axios.get(url, {
-		responseType: "arraybuffer"
-	});
+      progress.report({ message: "Extracting..." });
 
-	fs.writeFileSync(zipPath, response.data);
+      const zip = new AdmZip(zipPath);
+      zip.extractAllTo(storagePath, true);
 
-	const zip = new AdmZip(zipPath);
+      // Clean up zip after extraction
+      fs.unlinkSync(zipPath);
+    },
+  );
 
-	zip.extractAllTo(storagePath, true);
-
-	return faDir;
+  return faDir;
 }
 
-export function deactivate() { }
+export function deactivate() {}
